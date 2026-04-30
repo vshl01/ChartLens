@@ -46,6 +46,18 @@ class BubbleView(context: Context) : View(context) {
   private var pulse: Float = 0f
   private var state: String = "idle"
 
+  private var badgeText: String? = null
+  private var badgeTone: String = "neutral"
+  private val badgeFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    style = Paint.Style.FILL
+  }
+  private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    color = Color.WHITE
+    textAlign = Paint.Align.CENTER
+    textSize = 18f
+    isFakeBoldText = true
+  }
+
   private var spinAnimator: ValueAnimator? = null
   private var pulseAnimator: ValueAnimator? = null
 
@@ -72,19 +84,29 @@ class BubbleView(context: Context) : View(context) {
   fun setState(newState: String) {
     state = newState
     when (state) {
-      "capturing", "processing" -> {
+      "capturing", "processing", "analyzing" -> {
         startSpin()
         startPulse()
       }
-      "result" -> {
+      "result", "highlighting" -> {
         stopSpin()
         startPulse()
+      }
+      "expanded" -> {
+        stopSpin()
+        stopPulse()
       }
       else -> {
         stopSpin()
         stopPulse()
       }
     }
+    invalidate()
+  }
+
+  fun setBadge(text: String?, tone: String?) {
+    badgeText = if (text.isNullOrBlank()) null else text
+    badgeTone = tone ?: "neutral"
     invalidate()
   }
 
@@ -185,12 +207,16 @@ class BubbleView(context: Context) : View(context) {
         ringPaint.color = Color.WHITE
         canvas.drawArc(RectF(cx - rr, cy - rr, cx + rr, cy + rr), spinAngle, 90f, false, ringPaint)
       }
-      "processing" -> {
+      "processing", "analyzing" -> {
         ringPaint.color = Color.parseColor("#10B981")
         canvas.drawArc(RectF(cx - rr, cy - rr, cx + rr, cy + rr), spinAngle, 130f, false, ringPaint)
       }
-      "result" -> {
+      "result", "highlighting" -> {
         ringPaint.color = Color.parseColor("#22C55E")
+        canvas.drawCircle(cx, cy, rr, ringPaint)
+      }
+      "expanded" -> {
+        ringPaint.color = Color.parseColor("#5B6CFF")
         canvas.drawCircle(cx, cy, rr, ringPaint)
       }
       "error" -> {
@@ -198,6 +224,32 @@ class BubbleView(context: Context) : View(context) {
         canvas.drawCircle(cx, cy, rr, ringPaint)
       }
       else -> {}
+    }
+
+    // badge (top-right)
+    val text = badgeText
+    if (!text.isNullOrEmpty()) {
+      val badgeR = r * 0.32f
+      val bx = cx + r * 0.65f
+      val by = cy - r * 0.65f
+      val toneColor = when (badgeTone) {
+        "success" -> Color.parseColor("#22C55E")
+        "warning" -> Color.parseColor("#F59E0B")
+        else -> Color.parseColor("#475569")
+      }
+      badgeFillPaint.color = toneColor
+      // white outline so the badge reads against any bubble color
+      val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.WHITE
+      }
+      canvas.drawCircle(bx, by, badgeR, badgeFillPaint)
+      canvas.drawCircle(bx, by, badgeR, outline)
+      val ts = (badgeR * 1.15f).coerceAtMost(22f)
+      badgeTextPaint.textSize = ts
+      val txtY = by - (badgeTextPaint.descent() + badgeTextPaint.ascent()) / 2f
+      canvas.drawText(text, bx, txtY, badgeTextPaint)
     }
   }
 }

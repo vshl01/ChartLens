@@ -1,8 +1,23 @@
 import {create} from 'zustand';
 import type {HistoryEntry} from '@/types';
-import {readJSON, writeJSON, StorageKeys} from '@services/storage';
+import {readJSON, writeJSON, storage, StorageKeys} from '@services/storage';
 
 const MAX_ENTRIES = 200;
+const HISTORY_VERSION_KEY = 'history.version';
+const HISTORY_VERSION = 2; // bumped when entry shape changes
+
+function maybeMigrate(): HistoryEntry[] {
+  const current = storage.getString(HISTORY_VERSION_KEY);
+  const v = current ? Number(current) : 0;
+  if (v >= HISTORY_VERSION) {
+    return readJSON<HistoryEntry[]>(StorageKeys.history, []);
+  }
+  // Schema changed (presetId/name/responseJson → patternId/name/matches[]).
+  // Personal-use app: wipe rather than write a fragile migrator.
+  writeJSON(StorageKeys.history, []);
+  storage.set(HISTORY_VERSION_KEY, String(HISTORY_VERSION));
+  return [];
+}
 
 type HistoryStore = {
   entries: HistoryEntry[];
@@ -13,7 +28,7 @@ type HistoryStore = {
 };
 
 export const useHistory = create<HistoryStore>((set, get) => ({
-  entries: readJSON<HistoryEntry[]>(StorageKeys.history, []),
+  entries: maybeMigrate(),
   add: entry => {
     const next = [entry, ...get().entries].slice(0, MAX_ENTRIES);
     writeJSON(StorageKeys.history, next);
@@ -25,8 +40,8 @@ export const useHistory = create<HistoryStore>((set, get) => ({
     set({entries: next});
   },
   bulkRemove: ids => {
-    const set2 = new Set(ids);
-    const next = get().entries.filter(e => !set2.has(e.id));
+    const idSet = new Set(ids);
+    const next = get().entries.filter(e => !idSet.has(e.id));
     writeJSON(StorageKeys.history, next);
     set({entries: next});
   },

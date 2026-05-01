@@ -4,7 +4,7 @@ import {readJSON, writeJSON, StorageKeys} from '@services/storage';
 
 const DEFAULTS: AppSettings = {
   model: 'gemini-2.5-flash',
-  defaultPresetId: 'bullish_engulfing',
+  defaultPatternId: 'bullish_engulfing',
   bubbleSize: 56,
   bubbleOpacity: 0.95,
   bubbleX: -1,
@@ -15,6 +15,9 @@ const DEFAULTS: AppSettings = {
   hiddenBrokerIds: [],
   customBrokerIds: [],
   onboardingComplete: false,
+  boxAutoDismissSec: 20,
+  minConfidence: 0.6,
+  maxRenderedBoxes: 30,
 };
 
 type SettingsStore = {
@@ -23,8 +26,13 @@ type SettingsStore = {
   reset(): void;
 };
 
+function loadSettings(): AppSettings {
+  const stored = readJSON<Partial<AppSettings>>(StorageKeys.settings, {});
+  return {...DEFAULTS, ...stored} as AppSettings;
+}
+
 export const useSettings = create<SettingsStore>((set, get) => ({
-  settings: readJSON<AppSettings>(StorageKeys.settings, DEFAULTS),
+  settings: loadSettings(),
   set: (key, value) => {
     const next = {...get().settings, [key]: value};
     writeJSON(StorageKeys.settings, next);

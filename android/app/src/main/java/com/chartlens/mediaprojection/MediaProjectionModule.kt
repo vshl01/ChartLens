@@ -109,23 +109,67 @@ class MediaProjectionModule(private val reactContext: ReactApplicationContext) :
   fun captureFrame(promise: Promise) {
     val service = CaptureService.instance
     if (service == null) {
+      android.util.Log.w("ChartLens", "captureFrame: service not running")
       promise.reject("ERR_NOT_RUNNING", "Capture service not running")
       return
     }
     Thread {
-      var attempts = 0
-      var result: CaptureService.CaptureResult? = null
-      while (attempts < 6 && result == null) {
-        result = service.captureLatest()
-        if (result == null) {
-          try { Thread.sleep(80) } catch (_: InterruptedException) {}
-        }
-        attempts++
-      }
-      if (result == null) {
-        promise.reject("ERR_NO_FRAME", "Failed to acquire frame")
+      val started = System.currentTimeMillis()
+      val baseline = service.currentFrameCount()
+      android.util.Log.d("ChartLens", "captureFrame: thread start, baseline=$baseline")
+      if (!service.ensureDisplay()) {
+        android.util.Log.w("ChartLens", "captureFrame: display unavailable and cannot be rebuilt")
+        promise.reject(
+          "ERR_NO_DISPLAY",
+          "Capture display is gone — tap the broker card on Home to restart the session.",
+        )
         return@Thread
       }
+      // Try whatever's currently buffered first — if a frame is sitting in
+      // the ImageReader queue, use it. Only wait for a new frame if the
+      // queue is empty.
+      var result: CaptureService.CaptureResult? = try {
+        service.captureLatest()
+      } catch (e: Throwable) {
+        android.util.Log.e("ChartLens", "captureFrame: captureLatest threw (quick)", e)
+        null
+      }
+      if (result == null) {
+        val newCount = service.waitForNewFrame(baseline, 3000L)
+        if (newCount < 0) {
+          val elapsed = System.currentTimeMillis() - started
+          android.util.Log.w("ChartLens", "captureFrame: no new frame within 3s (${elapsed}ms)")
+          promise.reject(
+            "ERR_NO_FRAME",
+            "No new frame within 3s — interact with the chart (e.g. scroll) and tap again",
+          )
+          return@Thread
+        }
+        var attempts = 0
+        while (attempts < 5 && result == null) {
+          try {
+            result = service.captureLatest()
+          } catch (e: Throwable) {
+            android.util.Log.e("ChartLens", "captureFrame: captureLatest threw", e)
+            promise.reject("ERR_CAPTURE", e.message ?: "captureLatest threw")
+            return@Thread
+          }
+          if (result == null) {
+            try { Thread.sleep(60) } catch (_: InterruptedException) {}
+          }
+          attempts++
+        }
+      }
+      val elapsed = System.currentTimeMillis() - started
+      if (result == null) {
+        android.util.Log.w("ChartLens", "captureFrame: acquire failed after wait (${elapsed}ms)")
+        promise.reject("ERR_NO_FRAME", "Frame arrived but acquire failed")
+        return@Thread
+      }
+      android.util.Log.d(
+        "ChartLens",
+        "captureFrame: ok in ${elapsed}ms ${result.width}x${result.height}",
+      )
       val map = Arguments.createMap()
       map.putString("base64", result.base64)
       map.putInt("width", result.width)

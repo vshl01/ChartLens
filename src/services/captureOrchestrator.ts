@@ -1,54 +1,85 @@
-import {Alert, NativeEventEmitter, NativeModules} from 'react-native';
+import {Alert} from 'react-native';
+import {create} from 'zustand';
 import {Overlay, OverlayEvents} from '@native/OverlayModule';
 import {MediaProjection} from '@native/MediaProjectionModule';
 import {AppLauncher} from '@native/AppLauncherModule';
 import {findBroker} from '@registry/brokers';
-import type {Preset} from '@registry/presets';
-
-const HARD_FALLBACK_PRESET: Preset = {
-  id: 'fallback',
-  name: 'Describe chart',
-  emoji: '📈',
-  category: 'custom',
-  prompt: 'Describe this candlestick chart briefly. Return JSON: {"summary":string}.',
-  format: 'json',
-  builtin: true,
-};
-import {analyzeChart, GeminiError} from '@services/gemini';
-import {formatResponse} from '@utils/formatResponse';
+import {findPattern, PATTERNS, PATTERN_BY_ID} from '@registry/patterns';
+import type {PatternEntry} from '@registry/patterns';
 import {getGeminiKey} from '@services/secureStorage';
 import {useSettings} from '@store/settingsStore';
 import {useHistory} from '@store/historyStore';
 import {useSession} from '@store/sessionStore';
-import {usePresets} from '@store/presetStore';
 import {createLogger} from '@utils/logger';
+import type {CandleMatch, PatternPickerItem} from '@/types';
 
 const log = createLogger('orchestrator');
 
 type Subscription = {remove(): void};
 
+export type FlowState =
+  | 'IDLE'
+  | 'PICKING'
+  | 'CAPTURING'
+  | 'ANALYZING'
+  | 'HIGHLIGHTING';
+
+type FlowStore = {
+  state: FlowState;
+  patternId?: string;
+  matchCount: number;
+  lastFrameWidth: number;
+  lastFrameHeight: number;
+  transitions: Array<{at: number; from: FlowState; to: FlowState; note?: string}>;
+  set(next: Partial<FlowStore>): void;
+  transition(to: FlowState, note?: string): void;
+};
+
+export const useFlow = create<FlowStore>((set, get) => ({
+  state: 'IDLE',
+  matchCount: 0,
+  lastFrameWidth: 0,
+  lastFrameHeight: 0,
+  transitions: [],
+  set: next => set(next),
+  transition: (to, note) => {
+    const from = get().state;
+    if (from === to) return;
+    log.info('flow', from, '→', to, note ?? '');
+    set(prev => ({
+      state: to,
+      transitions: [...prev.transitions, {at: Date.now(), from, to, note}].slice(-100),
+    }));
+  },
+}));
+
 let bubbleTapSub: Subscription | null = null;
 let longPressSub: Subscription | null = null;
-let inFlight = false;
+let pickerSub: Subscription | null = null;
+let pickerDismissSub: Subscription | null = null;
+let clearSub: Subscription | null = null;
+let highlightTapSub: Subscription | null = null;
+let highlightClearedSub: Subscription | null = null;
+let staleFrameSub: Subscription | null = null;
+
+let inFlightAbort: AbortController | null = null;
 let lastTapAt = 0;
+let lastPickerOpenAt = 0;
 
-function pickPreset(): Preset {
-  const {settings} = useSettings.getState();
-  const presets = usePresets.getState().presets;
-  const fromUser = presets.find(p => p.id === settings.defaultPresetId);
-  return fromUser ?? presets[0] ?? HARD_FALLBACK_PRESET;
-}
-
-function fillPrompt(template: string): string {
-  // Replace {n} with 50 (default lookback) for now.
-  return template.replace(/\{n\}/g, '50');
+function pickerItems(): PatternPickerItem[] {
+  return PATTERNS.map(p => ({
+    id: p.id,
+    name: p.name,
+    hint: p.hint,
+    emoji: p.emoji,
+    color: p.color,
+  }));
 }
 
 export async function startSession(brokerId: string): Promise<void> {
   const broker = findBroker(brokerId);
   if (!broker) return;
 
-  // 1. overlay permission
   const hasOverlay = await Overlay.hasOverlayPermission();
   if (!hasOverlay) {
     await Overlay.requestOverlayPermission();
@@ -59,7 +90,18 @@ export async function startSession(brokerId: string): Promise<void> {
     return;
   }
 
-  // 2. MediaProjection consent
+  // If a session is already active and the projection service is still
+  // running, just relaunch the broker — restarting the projection mid-flow
+  // races the old MediaProjection.onStop with new display setup and can
+  // leave the ImageReader torn down.
+  const existing = useSession.getState();
+  const projectionAlive = await MediaProjection.isServiceRunning().catch(() => false);
+  if (existing.active && projectionAlive) {
+    log.info('session already active, just relaunching broker');
+    await AppLauncher.launchApp(broker.packageName, broker.deepLink ?? null);
+    return;
+  }
+
   try {
     const token = await MediaProjection.requestProjection();
     await MediaProjection.startService(token.resultCode);
@@ -68,7 +110,6 @@ export async function startSession(brokerId: string): Promise<void> {
     return;
   }
 
-  // 3. Capture broker icon for bubble
   let iconB64: string | null = null;
   try {
     iconB64 = await AppLauncher.getAppIcon(broker.packageName);
@@ -76,7 +117,6 @@ export async function startSession(brokerId: string): Promise<void> {
     iconB64 = null;
   }
 
-  // 4. show bubble
   const {settings} = useSettings.getState();
   await Overlay.showBubble({
     size: settings.bubbleSize,
@@ -87,17 +127,25 @@ export async function startSession(brokerId: string): Promise<void> {
     brokerIconBase64: iconB64 ?? undefined,
     glyph: broker.name.charAt(0),
   });
+  await Overlay.setBubbleBadge(null, 'neutral');
 
   attachListeners();
-
   useSession.getState().start(brokerId);
+  useFlow.getState().transition('IDLE', 'session started');
 
-  // 5. launch broker
   await AppLauncher.launchApp(broker.packageName, broker.deepLink ?? null);
 }
 
 export async function stopSession(): Promise<void> {
   detachListeners();
+  inFlightAbort?.abort();
+  inFlightAbort = null;
+  try {
+    await Overlay.clearHighlightOverlay();
+  } catch {}
+  try {
+    await Overlay.hidePatternPicker();
+  } catch {}
   try {
     await Overlay.hideBubble();
   } catch {}
@@ -105,6 +153,7 @@ export async function stopSession(): Promise<void> {
     await MediaProjection.stopService();
   } catch {}
   useSession.getState().stop();
+  useFlow.getState().transition('IDLE', 'session stopped');
 }
 
 function attachListeners(): void {
@@ -116,114 +165,222 @@ function attachListeners(): void {
   longPressSub = OverlayEvents.addListener('OverlayLongPress', () => {
     void stopSession();
   });
+  pickerSub = OverlayEvents.addListener('OverlayPatternPicked', (e: {id?: string}) => {
+    if (e?.id) void onPatternPicked(e.id);
+  });
+  pickerDismissSub = OverlayEvents.addListener('OverlayPickerDismissed', () => {
+    if (useFlow.getState().state === 'PICKING') {
+      useFlow.getState().transition('IDLE', 'picker dismissed');
+    }
+  });
+  clearSub = OverlayEvents.addListener('OverlayClearTapped', () => {
+    void clearHighlights('clear button');
+  });
+  highlightTapSub = OverlayEvents.addListener('OverlayHighlightTapped', () => {
+    // no-op for now: surface to UI later if useful
+  });
+  highlightClearedSub = OverlayEvents.addListener('OverlayHighlightCleared', () => {
+    if (useFlow.getState().state === 'HIGHLIGHTING') {
+      useFlow.getState().transition('IDLE', 'auto/manual cleared');
+    }
+  });
+  staleFrameSub = OverlayEvents.addListener('OverlayStaleFrame', () => {
+    void Overlay.showToast('Screen rotated, please re-capture', 'warning');
+    void clearHighlights('stale frame');
+  });
 }
 
 function detachListeners(): void {
   bubbleTapSub?.remove();
   longPressSub?.remove();
+  pickerSub?.remove();
+  pickerDismissSub?.remove();
+  clearSub?.remove();
+  highlightTapSub?.remove();
+  highlightClearedSub?.remove();
+  staleFrameSub?.remove();
   bubbleTapSub = null;
   longPressSub = null;
+  pickerSub = null;
+  pickerDismissSub = null;
+  clearSub = null;
+  highlightTapSub = null;
+  highlightClearedSub = null;
+  staleFrameSub = null;
 }
 
 async function onBubbleTap(): Promise<void> {
   const now = Date.now();
-  if (now - lastTapAt < 500) return;
+  if (now - lastTapAt < 250) return; // debounce
   lastTapAt = now;
-  if (inFlight) return;
-  inFlight = true;
 
-  const {settings} = useSettings.getState();
-  const session = useSession.getState();
-  const preset = pickPreset();
+  const flow = useFlow.getState();
+  // re-tap during HIGHLIGHTING or CAPTURING/ANALYZING: clear and restart picker
+  if (flow.state === 'HIGHLIGHTING') {
+    await clearHighlights('re-tap');
+  }
+  if (flow.state === 'CAPTURING' || flow.state === 'ANALYZING') {
+    inFlightAbort?.abort();
+    inFlightAbort = null;
+  }
+  if (flow.state === 'PICKING') {
+    if (now - lastPickerOpenAt < 250) return;
+    return; // already open
+  }
+  await openPicker();
+}
 
-  const showError = async (msg: string) => {
-    log.error('capture failed:', msg);
-    await Overlay.setBubbleState('error').catch(() => undefined);
-    await Overlay.showResultError(msg).catch(() => undefined);
-  };
-
+async function openPicker(): Promise<void> {
+  lastPickerOpenAt = Date.now();
+  useFlow.getState().transition('PICKING', 'opening picker');
+  await Overlay.setBubbleState('expanded').catch(() => undefined);
   try {
-    const apiKey = await getGeminiKey();
-    if (!apiKey) {
-      await showError('No Gemini API key. Open ChartLens → Settings to add one.');
-      return;
-    }
-
-    await Overlay.setBubbleState('capturing');
-    await Overlay.showResultProgress('Capturing chart…', '#5B6CFF').catch(() => undefined);
-
-    const captureStart = Date.now();
-    let frame: Awaited<ReturnType<typeof MediaProjection.captureFrame>>;
-    try {
-      frame = await MediaProjection.captureFrame();
-    } catch (e) {
-      await showError(`Capture failed: ${(e as Error).message}`);
-      return;
-    }
-    const captureMs = Date.now() - captureStart;
-
-    if ((frame as unknown as {isBlack?: boolean}).isBlack) {
-      await showError(
-        'Screen capture blocked by this app (FLAG_SECURE). Install LSPosed + DisableFlagSecure on a rooted device.',
-      );
-      return;
-    }
-
-    await Overlay.setBubbleState('processing');
-    await Overlay.showResultProgress(`Analyzing — ${preset.name}…`, '#10B981').catch(
-      () => undefined,
-    );
-    const prompt = preset.prompt
-      ? fillPrompt(preset.prompt)
-      : 'Describe this candlestick chart briefly.';
-    const geminiStart = Date.now();
-    let result;
-    try {
-      result = await analyzeChart({
-        apiKey,
-        model: settings.model,
-        userPrompt: prompt,
-        imageBase64: frame.base64,
-      });
-    } catch (e) {
-      const msg =
-        e instanceof GeminiError
-          ? `Gemini ${e.code}: ${e.message}`
-          : (e as Error).message ?? 'Unknown error';
-      await showError(msg);
-      return;
-    }
-    const geminiMs = Date.now() - geminiStart;
-
-    await Overlay.setBubbleState('result');
-    const pretty = formatResponse(result.text, result.parsed);
-    const timing = `${preset.emoji} ${preset.name} · capture ${captureMs}ms · gemini ${geminiMs}ms`;
-    await Overlay.showResultMessage(`ChartLens · ${preset.name}`, pretty || '(empty response)', timing);
-
-    useHistory.getState().add({
-      id: `${Date.now()}`,
-      brokerId: session.brokerId ?? 'unknown',
-      presetId: preset.id,
-      presetName: preset.name,
-      prompt,
-      imageUri: '',
-      responseText: result.text,
-      responseJson: result.parsed,
-      capturedAt: Date.now(),
-      captureMs,
-      geminiMs,
-      model: settings.model,
-    });
-
-    setTimeout(() => {
-      void Overlay.setBubbleState('idle');
-    }, 1500);
+    await Overlay.showPatternPicker(pickerItems());
   } catch (e) {
-    await showError((e as Error).message ?? 'Unknown error');
-  } finally {
-    inFlight = false;
+    log.warn('picker show failed', (e as Error).message);
+    useFlow.getState().transition('IDLE', 'picker show failed');
+    await Overlay.setBubbleState('idle').catch(() => undefined);
   }
 }
 
-// no-op to silence unused emitter import if events module is null
-export const _unused = NativeEventEmitter || NativeModules;
+async function onPatternPicked(patternId: string): Promise<void> {
+  const pattern = findPattern(patternId);
+  if (!pattern) {
+    log.warn('unknown pattern picked', patternId);
+    return;
+  }
+  await Overlay.hidePatternPicker().catch(() => undefined);
+  useFlow.getState().set({patternId});
+  await runCaptureAndAnalyze(pattern);
+}
+
+async function runCaptureAndAnalyze(pattern: PatternEntry): Promise<void> {
+  try {
+    await runCaptureAndAnalyzeInner(pattern);
+  } catch (e) {
+    // Outer safety net — any unhandled error here means the bubble could be
+    // stuck invisible or in a bogus state. Restore it.
+    log.error('runCaptureAndAnalyze unhandled', (e as Error).message, (e as Error).stack);
+    await Overlay.setBubbleVisible(true).catch(() => undefined);
+    await Overlay.setBubbleState('error').catch(() => undefined);
+    await Overlay.setBubbleBadge(null, 'neutral').catch(() => undefined);
+    await Overlay.showToast(
+      `Internal error: ${(e as Error).message}`,
+      'warning',
+    ).catch(() => undefined);
+    useFlow.getState().transition('IDLE', 'unhandled error');
+    setTimeout(() => {
+      void Overlay.setBubbleState('idle').catch(() => undefined);
+    }, 1500);
+  }
+}
+
+async function runCaptureAndAnalyzeInner(pattern: PatternEntry): Promise<void> {
+  const flow = useFlow.getState();
+  log.info('flow→CAPTURING for', pattern.id);
+  flow.transition('CAPTURING', `pattern=${pattern.id}`);
+  await Overlay.setBubbleState('capturing').catch(() => undefined);
+  await Overlay.clearHighlightOverlay().catch(() => undefined);
+
+  const {settings} = useSettings.getState();
+  const session = useSession.getState();
+  const apiKey = await getGeminiKey();
+  if (!apiKey) {
+    await Overlay.showToast(
+      'No Gemini API key. Open ChartLens → Settings to add one.',
+      'warning',
+    ).catch(() => undefined);
+    flow.transition('IDLE', 'no key');
+    return;
+  }
+
+  // Run capture + Gemini call + draw entirely in native Kotlin so it
+  // doesn't depend on the JS thread, which Realme/OnePlus/Xiaomi/etc.
+  // throttle aggressively when the broker app is foregrounded. The native
+  // method draws the highlight overlay on the main thread itself, so even
+  // if JS is paused, the user sees the boxes immediately.
+  flow.transition('ANALYZING', `pattern=${pattern.id}`);
+  await Overlay.setBubbleState('analyzing').catch(() => undefined);
+
+  let summary: Awaited<ReturnType<typeof Overlay.runAnalyzeAndDraw>>;
+  try {
+    summary = await Overlay.runAnalyzeAndDraw({
+      apiKey,
+      model: settings.model,
+      patternId: pattern.id,
+      patternName: pattern.name,
+      patternDef: pattern.definition,
+      color: pattern.color,
+      minConfidence: settings.minConfidence,
+      maxBoxes: settings.maxRenderedBoxes,
+      autoDismissMs:
+        settings.boxAutoDismissSec === 0 ? 0 : settings.boxAutoDismissSec * 1000,
+    });
+  } catch (e) {
+    log.error('runAnalyzeAndDraw threw', (e as Error).message);
+    flow.transition('IDLE', 'analyze error');
+    return; // native already showed a toast and set bubble state
+  }
+
+  log.info(
+    'analysis done: matches=', summary.matchCount,
+    'frame=', summary.frameWidth, 'x', summary.frameHeight,
+    'capture=', summary.captureMs, 'ms gemini=', summary.geminiMs, 'ms',
+  );
+
+  flow.set({
+    lastFrameWidth: summary.frameWidth,
+    lastFrameHeight: summary.frameHeight,
+    matchCount: summary.matchCount,
+  });
+
+  // Persist to history (native already drew the boxes).
+  const histMatches: CandleMatch[] = summary.matches.map(m => ({
+    idx: m.idx,
+    pattern: pattern.id,
+    confidence: m.confidence,
+    bbox: {x: m.x, y: m.y, w: m.w, h: m.h},
+    note: m.note,
+  }));
+  useHistory.getState().add({
+    id: `${Date.now()}`,
+    brokerId: session.brokerId ?? 'unknown',
+    patternId: pattern.id,
+    patternName: pattern.name,
+    prompt: pattern.definition,
+    imageUri: '',
+    responseText: summary.rawText,
+    matches: histMatches,
+    capturedAt: Date.now(),
+    captureMs: summary.captureMs,
+    geminiMs: summary.geminiMs,
+    frameWidth: summary.frameWidth,
+    frameHeight: summary.frameHeight,
+    model: settings.model,
+    error: summary.gotChart ? undefined : 'no_chart_detected',
+  });
+
+  if (summary.matchCount === 0) {
+    flow.transition('IDLE', summary.gotChart ? 'zero matches' : 'no chart');
+  } else {
+    flow.transition('HIGHLIGHTING', `boxes=${summary.matchCount}`);
+  }
+}
+
+async function clearHighlights(reason: string): Promise<void> {
+  await Overlay.clearHighlightOverlay().catch(() => undefined);
+  await Overlay.setBubbleBadge(null, 'neutral').catch(() => undefined);
+  await Overlay.setBubbleState('idle').catch(() => undefined);
+  if (useFlow.getState().state === 'HIGHLIGHTING') {
+    useFlow.getState().transition('IDLE', `cleared: ${reason}`);
+  }
+}
+
+// also exported for the Quick Capture path on Home — skips the picker and uses default pattern
+export async function quickCapture(): Promise<void> {
+  const {settings} = useSettings.getState();
+  const pattern = PATTERN_BY_ID[settings.defaultPatternId] ?? PATTERNS[0];
+  if (!pattern) return;
+  await Overlay.hidePatternPicker().catch(() => undefined);
+  await runCaptureAndAnalyze(pattern);
+}

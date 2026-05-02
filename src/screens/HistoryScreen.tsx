@@ -28,8 +28,8 @@ export function HistoryScreen(): React.JSX.Element {
           keyExtractor={e => e.id}
           renderItem={({item}) => (
             <List.Item
-              title={item.presetName}
-              description={`${item.brokerId} • ${format(item.capturedAt, 'PP p')}`}
+              title={item.patternName}
+              description={`${item.brokerId} • ${item.matches.length} match${item.matches.length === 1 ? '' : 'es'} • ${format(item.capturedAt, 'PP p')}`}
             />
           )}
         />

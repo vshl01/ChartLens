@@ -4,19 +4,39 @@ export type CaptureSession = {
   active: boolean;
 };
 
+export type CandleBBox = {x: number; y: number; w: number; h: number};
+
+export type CandleMatch = {
+  idx: number;
+  pattern: string;
+  confidence: number;
+  bbox: CandleBBox;
+  note?: string;
+};
+
+export type GeminiAnalysis = {
+  imageWidth: number;
+  imageHeight: number;
+  matches: CandleMatch[];
+  error?: string;
+};
+
 export type HistoryEntry = {
   id: string;
   brokerId: string;
-  presetId: string;
-  presetName: string;
+  patternId: string;
+  patternName: string;
   prompt: string;
   imageUri: string;
   thumbnailUri?: string;
   responseText: string;
-  responseJson?: unknown;
+  analysis?: GeminiAnalysis;
+  matches: CandleMatch[];
   capturedAt: number;
   captureMs: number;
   geminiMs: number;
+  frameWidth: number;
+  frameHeight: number;
   model: string;
   error?: string;
 };
@@ -27,9 +47,12 @@ export type CaptureQuality = 'full' | '1080p' | '720p';
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 
+export type BoxAutoDismiss = 5 | 10 | 20 | 30 | 0; // 0 = never
+export type MinConfidence = 0.4 | 0.6 | 0.8;
+
 export type AppSettings = {
   model: GeminiModel;
-  defaultPresetId: string;
+  defaultPatternId: string;
   bubbleSize: number;
   bubbleOpacity: number;
   bubbleX: number;
@@ -42,6 +65,27 @@ export type AppSettings = {
   defaultBrokerId?: string;
   lastBrokerId?: string;
   onboardingComplete: boolean;
+  boxAutoDismissSec: BoxAutoDismiss;
+  minConfidence: MinConfidence;
+  maxRenderedBoxes: number;
+};
+
+export type PatternPickerItem = {
+  id: string;
+  name: string;
+  hint: string;
+  emoji: string;
+  color: string;
+};
+
+export type HighlightBox = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  label: string;
+  color: string;
+  confidence: number;
 };
 
 export type NativeError = {

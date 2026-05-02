@@ -124,17 +124,55 @@ class CaptureService : Service() {
 
   private fun startProjection(resultCode: Int, data: Intent) {
     val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-    projection = mpm.getMediaProjection(resultCode, data)
-    projection?.registerCallback(object : MediaProjection.Callback() {
+
+    // If a previous projection is alive, stop it cleanly first so its
+    // onStop() callback fires while we're still on the OLD generation —
+    // the callback won't touch the NEW display because it captures the
+    // generation by value.
+    try { projection?.stop() } catch (_: Exception) {}
+    teardownDisplay()
+
+    val gen = ++projectionGen
+    val newProjection: MediaProjection? = mpm.getMediaProjection(resultCode, data)
+    if (newProjection == null) {
+      android.util.Log.e("ChartLens", "startProjection: getMediaProjection returned null")
+      return
+    }
+    newProjection.registerCallback(object : MediaProjection.Callback() {
       override fun onStop() {
-        teardownDisplay()
+        // Only tear down if this callback belongs to the *current*
+        // generation. Old callbacks from replaced projections must not
+        // null out the new display.
+        if (gen == projectionGen) {
+          android.util.Log.d("ChartLens", "MediaProjection.onStop gen=$gen current — tearing down")
+          teardownDisplay()
+        } else {
+          android.util.Log.d("ChartLens", "MediaProjection.onStop gen=$gen stale (current=$projectionGen), ignoring")
+        }
       }
     }, null)
+    projection = newProjection
 
-    handlerThread = HandlerThread("CaptureThread").also { it.start() }
-    handler = Handler(handlerThread!!.looper)
+    if (handlerThread == null) {
+      handlerThread = HandlerThread("CaptureThread").also { it.start() }
+      handler = Handler(handlerThread!!.looper)
+    }
 
     setupVirtualDisplay()
+  }
+
+  private var projectionGen: Int = 0
+
+  /**
+   * Best-effort recovery if the display was torn down but the projection
+   * is still alive. Returns true if the display is usable on return.
+   */
+  fun ensureDisplay(): Boolean {
+    if (imageReader != null && virtualDisplay != null) return true
+    if (projection == null) return false
+    android.util.Log.w("ChartLens", "ensureDisplay: rebuilding torn-down display")
+    setupVirtualDisplay()
+    return imageReader != null && virtualDisplay != null
   }
 
   private fun setupVirtualDisplay() {
@@ -142,12 +180,42 @@ class CaptureService : Service() {
     computeMetrics()
     val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
     imageReader = reader
+    // Track frame arrivals so captureLatest() can wait for a fresh frame
+    // when the screen content is static (otherwise acquireLatestImage()
+    // returns null until something redraws).
+    reader.setOnImageAvailableListener({
+      synchronized(frameLock) {
+        frameCount++
+        frameLock.notifyAll()
+      }
+    }, handler)
     virtualDisplay = projection?.createVirtualDisplay(
       "ChartLensVD",
       width, height, density,
       DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
       reader.surface, null, handler,
     )
+  }
+
+  @Volatile private var frameCount: Long = 0L
+  private val frameLock = Object()
+
+  fun currentFrameCount(): Long = synchronized(frameLock) { frameCount }
+
+  /**
+   * Block up to [timeoutMs] for a NEW frame to arrive after [sinceCount].
+   * Returns the latest frame count (>= sinceCount + 1) or -1 on timeout.
+   */
+  fun waitForNewFrame(sinceCount: Long, timeoutMs: Long): Long {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    synchronized(frameLock) {
+      while (frameCount <= sinceCount) {
+        val remaining = deadline - System.currentTimeMillis()
+        if (remaining <= 0L) return -1
+        try { frameLock.wait(remaining) } catch (_: InterruptedException) { return -1 }
+      }
+      return frameCount
+    }
   }
 
   override fun onConfigurationChanged(newConfig: Configuration) {
@@ -181,8 +249,9 @@ class CaptureService : Service() {
 
       val isBlack = isMostlyBlack(cropped)
 
-      // Downscale long side to <=1280px for sane payload size to Gemini
-      val maxLong = 1280
+      // Keep candles legible to Gemini. Phones today are 1080–1440px wide;
+      // capping at 1920 gives better OCR than 1280 without ballooning upload.
+      val maxLong = 1920
       val longSide = max(cropped.width, cropped.height)
       val scaled =
         if (longSide > maxLong) {
@@ -195,7 +264,7 @@ class CaptureService : Service() {
         } else cropped
 
       val out = ByteArrayOutputStream()
-      scaled.compress(Bitmap.CompressFormat.JPEG, 80, out)
+      scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
       val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
       val w = scaled.width
       val h = scaled.height

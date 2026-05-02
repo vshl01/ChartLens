@@ -3,6 +3,7 @@ package com.chartlens.overlay
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -20,12 +21,14 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.ReadableArray
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
@@ -36,17 +39,49 @@ import kotlin.math.min
 class OverlayModule(private val reactContext: ReactApplicationContext) :
   ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
 
+  companion object {
+    @Volatile private var current: OverlayModule? = null
+
+    /**
+     * Synchronously toggle bubble visibility from a non-main thread.
+     * Blocks until the main thread has applied the change. Used by
+     * [com.chartlens.mediaprojection.MediaProjectionModule] so the
+     * hide-capture-show sequence does not depend on the (often-throttled)
+     * JS thread when the app is backgrounded.
+     */
+    fun setBubbleVisibilitySync(visible: Boolean) {
+      val o = current ?: return
+      val latch = java.util.concurrent.CountDownLatch(1)
+      o.main.post {
+        o.bubbleView?.visibility = if (visible) View.VISIBLE else View.INVISIBLE
+        latch.countDown()
+      }
+      latch.await(500L, java.util.concurrent.TimeUnit.MILLISECONDS)
+    }
+  }
+
   private val main = Handler(Looper.getMainLooper())
   private var wm: WindowManager? = null
   private var bubbleView: BubbleView? = null
   private var bubbleParams: WindowManager.LayoutParams? = null
-  private var resultPanel: ResultPanelView? = null
-  private var resultParams: WindowManager.LayoutParams? = null
+
+  // pattern picker overlay
+  private var pickerView: PatternPickerView? = null
+  private var pickerParams: WindowManager.LayoutParams? = null
+
+  // highlight overlay
+  private var highlightView: HighlightOverlayView? = null
+  private var highlightParams: WindowManager.LayoutParams? = null
+
+  // rotation tracked at capture time so we can refuse to render stale frames
+  private var captureOrientation: Int = Configuration.ORIENTATION_UNDEFINED
+
   private var sizePx: Int = 56
   private var lastBrokerColor: String? = null
 
   init {
     reactContext.addLifecycleEventListener(this)
+    current = this
   }
 
   override fun getName(): String = "OverlayModule"
@@ -54,7 +89,7 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
   override fun onHostResume() {}
   override fun onHostPause() {}
   override fun onHostDestroy() {
-    main.post { hideBubbleInternal() }
+    main.post { hideAllOverlays() }
   }
 
   private fun overlayType(): Int =
@@ -136,7 +171,7 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
   @ReactMethod
   fun hideBubble(promise: Promise) {
     main.post {
-      hideBubbleInternal()
+      hideAllOverlays()
       promise.resolve(null)
     }
   }
@@ -158,56 +193,205 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
   }
 
   @ReactMethod
-  fun setResultText(text: String, promise: Promise) {
+  fun setBubbleBadge(text: String?, tone: String?, promise: Promise) {
     main.post {
-      ensureResultPanel()
-      resultPanel?.resetMessageStyle()
-      resultPanel?.showMessage(null, text, null)
-      resultPanel?.visibility = View.VISIBLE
+      bubbleView?.setBadge(text, tone)
       promise.resolve(null)
     }
   }
 
   @ReactMethod
-  fun showResultProgress(label: String, accentHex: String?, promise: Promise) {
+  fun showPatternPicker(items: ReadableArray, promise: Promise) {
     main.post {
-      ensureResultPanel()
-      val color = try {
-        if (!accentHex.isNullOrBlank()) Color.parseColor(accentHex) else Color.parseColor("#5B6CFF")
-      } catch (_: Exception) { Color.parseColor("#5B6CFF") }
-      resultPanel?.showProgress(label, color)
-      resultPanel?.visibility = View.VISIBLE
+      try {
+        ensureWm()
+        ensurePicker()
+        val parsed = mutableListOf<PatternPickerView.Item>()
+        for (i in 0 until items.size()) {
+          val it = items.getMap(i) ?: continue
+          val id = if (it.hasKey("id")) it.getString("id") ?: continue else continue
+          val name = if (it.hasKey("name")) it.getString("name") ?: id else id
+          val hint = if (it.hasKey("hint")) it.getString("hint") ?: "" else ""
+          val emoji = if (it.hasKey("emoji")) it.getString("emoji") ?: "" else ""
+          val colorHex = if (it.hasKey("color")) it.getString("color") else null
+          val colorInt = try { Color.parseColor(colorHex ?: "#5B6CFF") } catch (_: Exception) { Color.parseColor("#5B6CFF") }
+          parsed += PatternPickerView.Item(id, name, hint, emoji, colorInt)
+        }
+
+        val anchorRight = bubbleAnchoredRight()
+        pickerView?.bind(parsed, anchorRight)
+        pickerView?.appearAnimated()
+        promise.resolve(null)
+      } catch (e: Exception) {
+        promise.reject("ERR_PICKER", e)
+      }
+    }
+  }
+
+  @ReactMethod
+  fun hidePatternPicker(promise: Promise) {
+    main.post {
+      pickerView?.dismissAnimated()
       promise.resolve(null)
     }
   }
 
   @ReactMethod
-  fun showResultMessage(title: String?, content: String, timing: String?, promise: Promise) {
+  fun showHighlightOverlay(
+    boxes: ReadableArray,
+    frameWidth: Int,
+    frameHeight: Int,
+    autoDismissMs: Double,
+    promise: Promise,
+  ) {
     main.post {
-      ensureResultPanel()
-      resultPanel?.resetMessageStyle()
-      resultPanel?.showMessage(title, content, timing)
-      resultPanel?.stopPulse()
-      resultPanel?.visibility = View.VISIBLE
-      promise.resolve(null)
+      try {
+        // staleness check: if device rotated since the captured frame, refuse
+        val currentOrientation = reactContext.resources.configuration.orientation
+        if (captureOrientation != Configuration.ORIENTATION_UNDEFINED &&
+          currentOrientation != captureOrientation
+        ) {
+          emit("OverlayStaleFrame", Arguments.createMap())
+          promise.resolve(null)
+          return@post
+        }
+        captureOrientation = currentOrientation
+
+        ensureWm()
+        ensureHighlight()
+        val parsed = mutableListOf<BoxRenderer.Box>()
+        for (i in 0 until boxes.size()) {
+          val b = boxes.getMap(i) ?: continue
+          val x = if (b.hasKey("x")) b.getDouble("x").toFloat() else continue
+          val y = if (b.hasKey("y")) b.getDouble("y").toFloat() else continue
+          val w = if (b.hasKey("w")) b.getDouble("w").toFloat() else continue
+          val h = if (b.hasKey("h")) b.getDouble("h").toFloat() else continue
+          val label = if (b.hasKey("label")) b.getString("label") ?: "" else ""
+          val colorHex = if (b.hasKey("color")) b.getString("color") else null
+          val confidence =
+            if (b.hasKey("confidence")) b.getDouble("confidence").toFloat() else 0f
+          val colorInt = try { Color.parseColor(colorHex ?: "#5B6CFF") } catch (_: Exception) { Color.parseColor("#5B6CFF") }
+          parsed += BoxRenderer.Box(x, y, w, h, label, colorInt, confidence)
+        }
+        highlightView?.visibility = View.VISIBLE
+        highlightView?.setData(parsed, frameWidth, frameHeight, autoDismissMs.toLong())
+        promise.resolve(null)
+      } catch (e: Exception) {
+        promise.reject("ERR_HIGHLIGHT", e)
+      }
     }
   }
 
   @ReactMethod
-  fun showResultError(message: String, promise: Promise) {
+  fun clearHighlightOverlay(promise: Promise) {
     main.post {
-      ensureResultPanel()
-      resultPanel?.showError(message)
-      resultPanel?.stopPulse()
-      resultPanel?.visibility = View.VISIBLE
+      highlightView?.fadeOutAndClear()
       promise.resolve(null)
     }
   }
 
+  /**
+   * One-shot end-to-end pattern detection that runs entirely on a native
+   * background thread. Independent of the JS thread so it works even when
+   * the OS throttles ChartLens because the broker app is foregrounded.
+   *
+   * The promise resolves with the analysis summary (matchCount, frame dims,
+   * timings). Boxes are drawn on the screen as a side effect — no extra JS
+   * call required.
+   */
   @ReactMethod
-  fun hideResult(promise: Promise) {
+  fun runAnalyzeAndDraw(args: ReadableMap, promise: Promise) {
+    Thread {
+      try {
+        val parsed = AnalyzeRunner.Args(
+          apiKey = args.getString("apiKey") ?: "",
+          model = args.getString("model") ?: "gemini-2.5-flash",
+          patternId = args.getString("patternId") ?: "",
+          patternName = args.getString("patternName") ?: "",
+          patternDef = args.getString("patternDef") ?: "",
+          color = args.getString("color") ?: "#5B6CFF",
+          minConfidence = if (args.hasKey("minConfidence")) args.getDouble("minConfidence") else 0.6,
+          maxBoxes = if (args.hasKey("maxBoxes")) args.getInt("maxBoxes") else 30,
+          autoDismissMs = if (args.hasKey("autoDismissMs")) args.getDouble("autoDismissMs").toLong() else 20000L,
+        )
+        val result = AnalyzeRunner.run(parsed)
+
+        // Draw boxes on the main thread without any JS round-trip.
+        val colorInt = AnalyzeRunner.parseColor(parsed.color)
+        val boxes = result.matches.map {
+          BoxRenderer.Box(
+            x = it.x, y = it.y, w = it.w, h = it.h,
+            label = parsed.patternName,
+            colorInt = colorInt,
+            confidence = it.confidence,
+          )
+        }
+
+        main.post {
+          ensureWm()
+          ensureHighlight()
+          if (boxes.isNotEmpty()) {
+            highlightView?.visibility = View.VISIBLE
+            highlightView?.setData(boxes, result.frameWidth, result.frameHeight, parsed.autoDismissMs)
+            bubbleView?.setBadge(boxes.size.toString(), "success")
+            bubbleView?.setState("highlighting")
+          } else {
+            // No matches or no chart — clear any old highlights, badge 0.
+            highlightView?.fadeOutAndClear()
+            bubbleView?.setBadge("0", "warning")
+            bubbleView?.setState("idle")
+            try {
+              val msg = if (!result.gotChart) "No chart detected in current view"
+              else "No ${parsed.patternName} found in current view"
+              Toast.makeText(reactContext, msg, Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {}
+          }
+        }
+
+        val summary = Arguments.createMap().apply {
+          putInt("matchCount", boxes.size)
+          putInt("frameWidth", result.frameWidth)
+          putInt("frameHeight", result.frameHeight)
+          putBoolean("gotChart", result.gotChart)
+          putDouble("durationMs", result.durationMs.toDouble())
+          putDouble("captureMs", result.captureMs.toDouble())
+          putDouble("geminiMs", result.geminiMs.toDouble())
+          putString("rawText", result.rawText.take(2000))
+          val arr = Arguments.createArray()
+          for (m in result.matches) {
+            val o = Arguments.createMap()
+            o.putInt("idx", m.idx)
+            o.putDouble("confidence", m.confidence.toDouble())
+            o.putDouble("x", m.x.toDouble())
+            o.putDouble("y", m.y.toDouble())
+            o.putDouble("w", m.w.toDouble())
+            o.putDouble("h", m.h.toDouble())
+            if (m.note != null) o.putString("note", m.note)
+            arr.pushMap(o)
+          }
+          putArray("matches", arr)
+        }
+        promise.resolve(summary)
+      } catch (e: Throwable) {
+        android.util.Log.e("ChartLens", "runAnalyzeAndDraw failed", e)
+        // Show toast natively too, since JS may be paused.
+        main.post {
+          try {
+            Toast.makeText(reactContext, e.message ?: "Analyze failed", Toast.LENGTH_LONG).show()
+            bubbleView?.setState("error")
+          } catch (_: Exception) {}
+        }
+        promise.reject("ERR_ANALYZE", e.message ?: "Analyze failed")
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun showToast(text: String, tone: String?, promise: Promise) {
     main.post {
-      resultPanel?.visibility = View.GONE
+      try {
+        Toast.makeText(reactContext, text, Toast.LENGTH_SHORT).show()
+      } catch (_: Exception) {}
       promise.resolve(null)
     }
   }
@@ -218,10 +402,18 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
   @ReactMethod
   fun removeListeners(@Suppress("UNUSED_PARAMETER") count: Int) {}
 
+  // -- internals --
+
   private fun ensureWm() {
     if (wm == null) {
       wm = reactContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     }
+  }
+
+  private fun bubbleAnchoredRight(): Boolean {
+    val params = bubbleParams ?: return true
+    val dm = reactContext.resources.displayMetrics
+    return params.x + sizePx / 2 > dm.widthPixels / 2
   }
 
   private fun createBubble(
@@ -306,9 +498,10 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
         MotionEvent.ACTION_UP -> {
           main.removeCallbacks(longPressRunnable)
           if (!dragging && System.currentTimeMillis() - downAt < longPressTimeout) {
+            // record orientation at the moment of intent — close enough
+            captureOrientation = reactContext.resources.configuration.orientation
             emit("OverlayBubbleTap", Arguments.createMap())
           } else if (dragging) {
-            // snap to nearest edge
             val dm = reactContext.resources.displayMetrics
             val midX = dm.widthPixels / 2
             val target = if (params.x + sizePx / 2 > midX) dm.widthPixels - sizePx - dp(8) else dp(8)
@@ -331,45 +524,79 @@ class OverlayModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
-  private fun ensureResultPanel() {
-    if (resultPanel != null) return
+  private fun ensurePicker() {
+    if (pickerView != null) return
     val ctx = reactContext.applicationContext
-    val panel = ResultPanelView(ctx)
-    panel.onCloseClicked = {
-      resultPanel?.visibility = View.GONE
-      emit("OverlayResultClosed", Arguments.createMap())
+    val view = PatternPickerView(ctx)
+    view.onPicked = { id ->
+      val map = Arguments.createMap()
+      map.putString("id", id)
+      emit("OverlayPatternPicked", map)
     }
-    val dm = reactContext.resources.displayMetrics
-    val maxHeight = (dm.heightPixels * 0.55f).toInt()
+    view.onDismissed = {
+      emit("OverlayPickerDismissed", Arguments.createMap())
+    }
+
     val lp = WindowManager.LayoutParams(
       WindowManager.LayoutParams.MATCH_PARENT,
-      maxHeight,
+      WindowManager.LayoutParams.MATCH_PARENT,
       overlayType(),
+      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+      PixelFormat.TRANSLUCENT,
+    ).apply {
+      gravity = Gravity.TOP or Gravity.START
+    }
+    pickerParams = lp
+    view.visibility = View.GONE
+    wm?.addView(view, lp)
+    pickerView = view
+  }
+
+  private fun ensureHighlight() {
+    if (highlightView != null) return
+    val ctx = reactContext.applicationContext
+    val view = HighlightOverlayView(ctx)
+    view.onCleared = {
+      emit("OverlayHighlightCleared", Arguments.createMap())
+    }
+    view.onBoxTapped = { idx ->
+      val map = Arguments.createMap()
+      map.putInt("index", idx)
+      emit("OverlayHighlightTapped", map)
+    }
+
+    val lp = WindowManager.LayoutParams(
+      WindowManager.LayoutParams.MATCH_PARENT,
+      WindowManager.LayoutParams.MATCH_PARENT,
+      overlayType(),
+      // FLAG_NOT_TOUCHABLE: every touch passes through to the broker app so
+      // panning/zooming the chart keeps working while boxes are drawn. Boxes
+      // are visual-only — they get cleared via auto-dismiss, the bubble's
+      // clear button, or a re-tap of the bubble.
       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
         WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
       PixelFormat.TRANSLUCENT,
     ).apply {
-      gravity = Gravity.BOTTOM or Gravity.START
-      y = 0
+      gravity = Gravity.TOP or Gravity.START
     }
-    resultParams = lp
-    ensureWm()
-    wm?.addView(panel, lp)
-    panel.visibility = View.GONE
-    resultPanel = panel
+    highlightParams = lp
+    view.visibility = View.GONE
+    wm?.addView(view, lp)
+    highlightView = view
   }
 
-  private fun hideBubbleInternal() {
-    try {
-      bubbleView?.let { wm?.removeView(it) }
-    } catch (_: Exception) {}
+  private fun hideAllOverlays() {
+    try { highlightView?.let { wm?.removeView(it) } } catch (_: Exception) {}
+    highlightView = null
+    highlightParams = null
+    try { pickerView?.let { wm?.removeView(it) } } catch (_: Exception) {}
+    pickerView = null
+    pickerParams = null
+    try { bubbleView?.let { wm?.removeView(it) } } catch (_: Exception) {}
     bubbleView = null
     bubbleParams = null
-    try {
-      resultPanel?.let { wm?.removeView(it) }
-    } catch (_: Exception) {}
-    resultPanel = null
-    resultParams = null
   }
 }
